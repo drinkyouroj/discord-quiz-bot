@@ -7,9 +7,9 @@ import logging
 import datetime 
 
 from config import config 
-from utils.openai_client import OpenAIClient
+from utils.openai_client import OpenAIClient # Assuming this path is correct
 
-logger = logging.getLogger(__name__) # Get a logger for this cog
+logger = logging.getLogger(__name__) 
 
 class GameManagerCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -20,7 +20,7 @@ class GameManagerCog(commands.Cog):
             logger.info("GameManagerCog __init__: OpenAIClient initialized.")
         except Exception as e:
             logger.error("GameManagerCog __init__: Failed to initialize OpenAIClient.", exc_info=True)
-            raise # Critical failure if OpenAI client can't init
+            raise 
 
         self.active_session_id = None
         
@@ -35,28 +35,32 @@ class GameManagerCog(commands.Cog):
         self.question_answered_by = None 
 
         self.quiz_channel = None 
+        # Attempt to get channel ID at init, but don't wait for bot ready here.
+        if config.QUIZ_CHANNEL_ID:
+            # We can't fetch the channel object itself yet as the bot might not be ready.
+            # We'll fetch it in _get_quiz_channel when needed.
+            logger.info(f"GameManagerCog __init__: QUIZ_CHANNEL_ID configured to {config.QUIZ_CHANNEL_ID}.")
+        else:
+            logger.warning("GameManagerCog __init__: QUIZ_CHANNEL_ID not set. Bot cannot post questions automatically.")
+
 
         logger.info("GameManagerCog __init__: Attempting to start question_inactivity_timer...")
         try:
             self.question_inactivity_timer.start()
             logger.info("GameManagerCog __init__: question_inactivity_timer started.")
+        except RuntimeError as e: # Handles "Task is already running" if cog is reloaded
+            logger.warning(f"GameManagerCog __init__: question_inactivity_timer could not be started (possibly already running): {e}")
         except Exception as e:
             logger.error("GameManagerCog __init__: Failed to start question_inactivity_timer.", exc_info=True)
-            # Decide if this is critical enough to raise
         logger.info("GameManagerCog __init__ complete.")
 
     async def cog_load(self):
+        # cog_load is called when the cog is actually loaded by the bot.
+        # It's a good place for setup that depends on the bot being somewhat initialized,
+        # but avoid long-blocking operations or `wait_until_ready` if possible.
         logger.info("GameManagerCog cog_load method called.")
-        if config.QUIZ_CHANNEL_ID:
-            logger.debug(f"GameManagerCog cog_load: Waiting for bot to be ready to fetch channel {config.QUIZ_CHANNEL_ID}...")
-            await self.bot.wait_until_ready() 
-            self.quiz_channel = self.bot.get_channel(config.QUIZ_CHANNEL_ID)
-            if not self.quiz_channel:
-                logger.error(f"GameManagerCog cog_load: Could not find QUIZ_CHANNEL_ID: {config.QUIZ_CHANNEL_ID}.")
-            else:
-                logger.info(f"GameManagerCog cog_load: Quiz channel set to: {self.quiz_channel.name} (ID: {self.quiz_channel.id})")
-        else:
-            logger.warning("GameManagerCog cog_load: QUIZ_CHANNEL_ID not set. Bot cannot post questions.")
+        # The channel will be fetched when first needed by _get_quiz_channel
+
             
     def cog_unload(self):
         logger.info("GameManagerCog cog_unload: Cancelling question_inactivity_timer...")
@@ -68,12 +72,29 @@ class GameManagerCog(commands.Cog):
 
     async def _get_quiz_channel(self) -> discord.TextChannel | None:
         """Ensures the quiz channel is available, re-fetching if necessary."""
-        if not self.quiz_channel: # If not set during cog_load or became None
+        if not self.quiz_channel: 
             if config.QUIZ_CHANNEL_ID:
-                logger.debug("_get_quiz_channel: quiz_channel is None, attempting to fetch.")
-                self.quiz_channel = self.bot.get_channel(config.QUIZ_CHANNEL_ID)
-                if not self.quiz_channel:
-                    logger.error(f"_get_quiz_channel: Re-fetch failed for QUIZ_CHANNEL_ID: {config.QUIZ_CHANNEL_ID}.")
+                if not self.bot.is_ready():
+                    logger.debug("_get_quiz_channel: Bot is not ready yet, waiting to fetch channel.")
+                    await self.bot.wait_until_ready() # Wait only if absolutely necessary here
+                
+                logger.debug(f"_get_quiz_channel: quiz_channel is None, attempting to fetch channel ID {config.QUIZ_CHANNEL_ID}.")
+                try:
+                    self.quiz_channel = self.bot.get_channel(config.QUIZ_CHANNEL_ID) or await self.bot.fetch_channel(config.QUIZ_CHANNEL_ID)
+                except discord.NotFound:
+                    logger.error(f"_get_quiz_channel: Channel ID {config.QUIZ_CHANNEL_ID} not found.")
+                    self.quiz_channel = None
+                except discord.Forbidden:
+                    logger.error(f"_get_quiz_channel: Bot lacks permissions to fetch channel ID {config.QUIZ_CHANNEL_ID}.")
+                    self.quiz_channel = None
+                except Exception as e:
+                    logger.error(f"_get_quiz_channel: Error fetching channel ID {config.QUIZ_CHANNEL_ID}: {e}", exc_info=True)
+                    self.quiz_channel = None
+
+                if self.quiz_channel:
+                    logger.info(f"_get_quiz_channel: Quiz channel set to: {self.quiz_channel.name} (ID: {self.quiz_channel.id})")
+                else:
+                    logger.error(f"_get_quiz_channel: Failed to fetch QUIZ_CHANNEL_ID: {config.QUIZ_CHANNEL_ID}.")
             else:
                 logger.warning("_get_quiz_channel: QUIZ_CHANNEL_ID not configured.")
         
@@ -89,8 +110,11 @@ class GameManagerCog(commands.Cog):
             raise ConnectionError("DatabaseManager not available.")
 
         if self.active_session_id:
-            await db_manager.end_quiz_session(self.active_session_id)
-            logger.info(f"Ended quiz session: {self.active_session_id}")
+            try:
+                await db_manager.end_quiz_session(self.active_session_id)
+                logger.info(f"Ended quiz session: {self.active_session_id}")
+            except Exception as e:
+                logger.error(f"Error ending quiz session {self.active_session_id}: {e}", exc_info=True)
         
         self.active_session_id = await db_manager.create_quiz_session()
         if not self.active_session_id:
@@ -104,17 +128,16 @@ class GameManagerCog(commands.Cog):
         session_details = await db_manager.get_session_details(self.active_session_id)
         start_time_str = "N/A"
         if session_details and session_details.get('start_time'):
-            # Ensure start_time is datetime object before strftime
             st = session_details['start_time']
-            if isinstance(st, str): # If Supabase returns ISO string
-                try: # Attempt to parse ISO 8601 format
+            if isinstance(st, str): 
+                try: 
                     st_parsed = datetime.datetime.fromisoformat(st.replace('Z', '+00:00'))
-                    st = st_parsed.astimezone(datetime.timezone.utc) # Ensure it's UTC
+                    st = st_parsed.astimezone(datetime.timezone.utc) 
                 except ValueError:
                      logger.error(f"Could not parse start_time string from DB: {st}")
-                     st = None # Fallback
+                     st = None 
             
-            if hasattr(st, 'strftime'): # Check if it's a datetime object
+            if hasattr(st, 'strftime'): 
                  start_time_str = st.strftime('%Y-%m-%d %H:%M UTC')
             else:
                  logger.warning(f"Session start_time is not a recognizable datetime object: {st}")
@@ -130,22 +153,28 @@ class GameManagerCog(commands.Cog):
         if clear_message_id:
              self.current_question_message_id = None
         self.current_question_post_time = None
+        # Ensure user_attempts is reset correctly. If it stores by message_id,
+        # clearing it entirely might be fine if only one question is active.
+        # If multiple questions could somehow be tracked (not current design), this needs care.
         self.user_attempts.clear() 
         self.question_answered_by = None
         logger.debug("_reset_question_state: Question state has been reset.")
 
     async def generate_and_post_new_question(self):
         logger.info("generate_and_post_new_question called.")
+        channel = await self._get_quiz_channel() # Ensure channel is available first
+        if not channel:
+            logger.error("generate_and_post_new_question: Quiz channel not available. Cannot post question.")
+            return
+
         if not self.active_session_id:
             logger.warning("generate_and_post_new_question: No active quiz session.")
-            channel = await self._get_quiz_channel()
-            if channel:
-                try:
-                    await channel.send("An admin needs to start a quiz session with `/resetscores` before questions can be asked.")
-                except discord.Forbidden:
-                    logger.error(f"generate_and_post_new_question: Missing permissions to send message in channel {channel.id}")
-                except Exception as e:
-                    logger.error(f"generate_and_post_new_question: Error sending no-active-session message: {e}", exc_info=True)
+            try:
+                await channel.send("An admin needs to start a quiz session with `/resetscores` before questions can be asked.")
+            except discord.Forbidden:
+                logger.error(f"generate_and_post_new_question: Missing permissions to send message in channel {channel.id}")
+            except Exception as e:
+                logger.error(f"generate_and_post_new_question: Error sending no-active-session message: {e}", exc_info=True)
             return
 
         self._reset_question_state() 
@@ -154,8 +183,7 @@ class GameManagerCog(commands.Cog):
             topics = self._load_topics()
             if not topics:
                 logger.error("generate_and_post_new_question: No topics found.")
-                channel = await self._get_quiz_channel()
-                if channel: await channel.send("Error: Could not load topics for the quiz. Admin check `topics.txt`.")
+                await channel.send("Error: Could not load topics for the quiz. Admin check `topics.txt`.")
                 return
 
             topic = random.choice(topics)
@@ -168,8 +196,7 @@ class GameManagerCog(commands.Cog):
             if not q_data or "error" in q_data:
                 error_msg = q_data.get("error", "Unknown error from OpenAI") if q_data else "No data from OpenAI"
                 logger.error(f"Failed to generate question from OpenAI: {error_msg}")
-                channel = await self._get_quiz_channel()
-                if channel: await channel.send(f"Oops! I had trouble thinking of a new question ({error_msg}). Trying again in a moment or an admin can use `/skipquestion`.")
+                await channel.send(f"Oops! I had trouble thinking of a new question ({error_msg}). Trying again in a moment or an admin can use `/skipquestion`.")
                 return
 
             self.current_question_text = q_data["question"]
@@ -180,35 +207,36 @@ class GameManagerCog(commands.Cog):
             elif "intermediate" in self.current_question_difficulty: self.current_question_points = config.POINTS_MEDIUM
             elif "advanced" in self.current_question_difficulty: self.current_question_points = config.POINTS_DIFFICULT
             else: 
-                self.current_question_points = config.POINTS_MEDIUM # Fallback
+                self.current_question_points = config.POINTS_MEDIUM 
                 logger.warning(f"Unknown difficulty '{self.current_question_difficulty}' from OpenAI, defaulting to medium points.")
 
+            embed = discord.Embed(
+                title=f"🧠 New Quiz Question! ({self.current_question_points} Points)",
+                description=self.current_question_text,
+                color=discord.Color.blurple()
+            )
+            embed.add_field(name="Topic", value=topic.title(), inline=True)
+            embed.add_field(name="Difficulty", value=self.current_question_difficulty.replace(" knowledge", "").title(), inline=True)
+            embed.set_footer(text=f"Session #{self.active_session_id} | Use /answer <your answer>")
+            
+            question_msg = await channel.send(embed=embed)
+            self.current_question_message_id = question_msg.id
+            self.current_question_post_time = datetime.datetime.now(datetime.timezone.utc)
+            if not isinstance(self.user_attempts, dict): self.user_attempts = {}
+            self.user_attempts[self.current_question_message_id] = {} 
+            logger.info(f"Posted new question (Msg ID: {self.current_question_message_id}): {self.current_question_text}")
 
-            channel = await self._get_quiz_channel()
-            if channel:
-                embed = discord.Embed(
-                    title=f"🧠 New Quiz Question! ({self.current_question_points} Points)",
-                    description=self.current_question_text,
-                    color=discord.Color.blurple()
-                )
-                embed.add_field(name="Topic", value=topic.title(), inline=True)
-                embed.add_field(name="Difficulty", value=self.current_question_difficulty.replace(" knowledge", "").title(), inline=True)
-                embed.set_footer(text=f"Session #{self.active_session_id} | Use /answer <your answer>")
-                
-                question_msg = await channel.send(embed=embed)
-                self.current_question_message_id = question_msg.id
-                self.current_question_post_time = datetime.datetime.now(datetime.timezone.utc)
-                # Ensure user_attempts is a dict for the current question message ID
-                if not isinstance(self.user_attempts, dict): self.user_attempts = {}
-                self.user_attempts[self.current_question_message_id] = {} 
-                logger.info(f"Posted new question (Msg ID: {self.current_question_message_id}): {self.current_question_text}")
-            else:
-                logger.error("generate_and_post_new_question: Cannot post question, quiz channel not found.")
-
+        except discord.Forbidden:
+            logger.error(f"generate_and_post_new_question: Bot lacks permissions in channel {channel.id if channel else 'Unknown'}.", exc_info=True)
+            # Optionally notify admin or try a fallback if possible
         except Exception as e:
             logger.error(f"Error in generate_and_post_new_question: {e}", exc_info=True)
-            channel = await self._get_quiz_channel()
-            if channel: await channel.send("A critical error occurred while trying to generate a new question.")
+            if channel: # Check if channel was resolved before error
+                try:
+                    await channel.send("A critical error occurred while trying to generate a new question.")
+                except Exception as send_e:
+                    logger.error(f"Failed to send critical error message to channel: {send_e}", exc_info=True)
+
 
     def _load_topics(self):
         try:
@@ -231,9 +259,14 @@ class GameManagerCog(commands.Cog):
             return "There's no active question or session right now."
         if self.question_answered_by:
             logger.info(f"process_user_answer: Question {self.current_question_message_id} already answered by {self.question_answered_by}.")
-            # Fetch the user who answered to mention them
-            answered_user = self.bot.get_user(self.question_answered_by) or await self.bot.fetch_user(self.question_answered_by)
-            answered_user_mention = answered_user.mention if answered_user else f"User ID {self.question_answered_by}"
+            try:
+                answered_user = self.bot.get_user(self.question_answered_by) or await self.bot.fetch_user(self.question_answered_by)
+                answered_user_mention = answered_user.mention if answered_user else f"User ID {self.question_answered_by}"
+            except discord.NotFound:
+                answered_user_mention = f"User ID {self.question_answered_by} (not found)"
+            except Exception as e:
+                logger.error(f"Error fetching user who answered: {e}")
+                answered_user_mention = f"User ID {self.question_answered_by}"
             return f"This question was already answered by {answered_user_mention}."
 
         self.current_question_post_time = datetime.datetime.now(datetime.timezone.utc) 
@@ -312,21 +345,23 @@ class GameManagerCog(commands.Cog):
                         original_embed = original_question_message.embeds[0].copy()
                         original_embed.color = discord.Color.green() if status == "correct" else discord.Color.orange()
                         original_embed.set_footer(text=f"Answered by {user.display_name} | Session #{self.active_session_id}")
-                        
-                        # Add answer to description or new field
-                        # To avoid making the embed too long, we'll just update the footer and color.
-                        # The public_feedback_parts will be sent as a new message.
-                        
                         await original_question_message.edit(embed=original_embed, view=None) 
-                        await channel.send(final_public_message) # Send separate message for answer details
+                        await channel.send(final_public_message) 
                     else: 
                         await channel.send(final_public_message)
                 except discord.NotFound:
                     logger.warning(f"Original question message {self.current_question_message_id} not found to update.")
                     await channel.send(final_public_message) 
+                except discord.Forbidden:
+                    logger.error(f"process_user_answer: Bot lacks permissions in channel {channel.id} to edit/send message.")
+                    # Fallback to just sending private feedback if public fails
                 except Exception as e:
                     logger.error(f"Error updating original question message or sending public feedback: {e}", exc_info=True)
-                    await channel.send(final_public_message) 
+                    try:
+                        await channel.send(final_public_message) 
+                    except Exception as send_e:
+                         logger.error(f"Failed to send fallback public feedback: {send_e}", exc_info=True)
+
             
             logger.info(f"Question {self.current_question_message_id} resolved. Scheduling next question.")
             asyncio.create_task(self.generate_and_post_new_question()) 
@@ -339,18 +374,17 @@ class GameManagerCog(commands.Cog):
             logger.warning("skip_current_question: No active question/session to skip.")
             return "No active question to skip."
         
-        # Store details before resetting state
         skipped_question_text = self.current_question_text
         skipped_intended_answer = self.current_question_intended_answer
         skipped_message_id = self.current_question_message_id
 
-        self._reset_question_state() # Reset state immediately so no new answers are processed for the old q
+        self._reset_question_state() 
         
         reveal_message = f"The question was: \"{skipped_question_text}\"\nThe intended answer was: **{skipped_intended_answer}**."
         
         if admin_initiated: reason = "Skipped by an admin."
         elif timeout_initiated: reason = f"Question timed out after {config.QUESTION_INACTIVITY_TIMEOUT_HOURS} hours of inactivity. No one got it right."
-        else: reason = "Question skipped."
+        else: reason = "Question skipped." # Should ideally not happen without a specific trigger
 
         full_message_for_channel = f"{reason}\n{reveal_message}"
         
@@ -361,25 +395,29 @@ class GameManagerCog(commands.Cog):
                 if original_question_message and original_question_message.embeds:
                     embed = original_question_message.embeds[0].copy()
                     embed.color = discord.Color.dark_grey()
-                    # Update embed description to show it's skipped and reveal answer
                     embed.description = (f"**This question was skipped.**\n\n"
                                          f"Original Question: {skipped_question_text}\n"
                                          f"Intended Answer: **{skipped_intended_answer}**")
-                    embed.clear_fields() # Remove old topic/difficulty fields
+                    embed.clear_fields() 
                     embed.add_field(name="Status", value="Skipped", inline=True)
-                    if self.active_session_id: # Check if active_session_id is still valid (it should be)
-                        embed.set_footer(text=f"Skipped | Session #{self.active_session_id}")
-                    else:
-                        embed.set_footer(text="Skipped")
+                    # Use self.active_session_id if available, otherwise a generic footer
+                    footer_session_id = self.active_session_id if self.active_session_id else "N/A"
+                    embed.set_footer(text=f"Skipped | Session #{footer_session_id}")
                     await original_question_message.edit(content=f"This question has been skipped. {reason}", embed=embed, view=None)
                 else: 
                     await channel.send(full_message_for_channel)
             except discord.NotFound:
                  logger.warning(f"Original question message {skipped_message_id} not found to update for skip.")
                  await channel.send(full_message_for_channel) 
+            except discord.Forbidden:
+                logger.error(f"skip_current_question: Bot lacks permissions in channel {channel.id} to edit/send message.")
+                # Fallback or just log
             except Exception as e:
                 logger.error(f"Error updating original question message on skip: {e}", exc_info=True)
-                await channel.send(full_message_for_channel) 
+                try:
+                    await channel.send(full_message_for_channel) 
+                except Exception as send_e:
+                    logger.error(f"Failed to send fallback skip message: {send_e}", exc_info=True)
         else:
             logger.error("skip_current_question: Cannot announce skipped question, quiz channel not found.")
 
@@ -387,10 +425,10 @@ class GameManagerCog(commands.Cog):
         return f"Question skipped. {reveal_message}" 
 
 
-    @tasks.loop(minutes=15) # Check every 15 minutes for inactivity
+    @tasks.loop(minutes=15) 
     async def question_inactivity_timer(self):
-        await self.bot.wait_until_ready() 
-
+        # This check runs periodically.
+        # It should only act if there's an active, unanswered question.
         if not self.active_session_id or not self.current_question_message_id or self.question_answered_by:
             return 
 
