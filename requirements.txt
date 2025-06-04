@@ -1,0 +1,18 @@
+# Core Discord library
+discord.py>=2.0.0
+
+# For loading .env files
+python-dotenv
+
+# OpenAI API client
+openai
+
+# Supabase client (or PostgreSQL driver)
+# Using supabase-py for direct Supabase interaction
+supabase>=2.0.0
+
+# Alternatively, for more direct PostgreSQL interaction with async:
+# asyncpg
+
+# For robust HTTP requests (OpenAI client might use it, or for general purposes)
+aiohttp
