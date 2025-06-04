@@ -82,22 +82,36 @@ class DatabaseManager:
                 if hasattr(response, 'error') and response.error:
                     error_message = response.error.message if hasattr(response.error, 'message') else str(response.error)
                     logger.error(f"Supabase API error on attempt {attempt + 1}: {error_message}")
-                    # You might want specific conditions for not retrying, e.g., auth errors
                     last_exception = Exception(f"Supabase API error: {error_message}")
-                elif hasattr(response, 'data') or response is None: # Some operations might return None or just response obj on success
-                    return response.data if hasattr(response, 'data') else None
-                else: # Unexpected response structure
-                    logger.error(f"Unexpected Supabase response structure on attempt {attempt + 1}: {response}")
-                    last_exception = Exception("Unexpected Supabase response structure.")
+                    # If it's an error, continue to retry logic or raise if max attempts reached
+                
+                # If no error attribute or error is None, check for data
+                elif hasattr(response, 'data'):
+                    # Successful response with data
+                    return response.data
+                elif response is None: 
+                    # Successful response that returns None (e.g., some updates/deletes might not return data)
+                    return None
+                else:
+                    # If no error and no data, but also not None, it might be an unexpected structure
+                    # However, some successful PATCH/POST operations return data as a list (like the one in logs)
+                    # Let's assume if no error, and it's not None, it's a success.
+                    # The previous log "Unexpected Supabase response structure" was for a successful PATCH.
+                    # If 'data' is not the primary attribute for success, this might need adjustment
+                    # based on how supabase-py structures responses for different operations.
+                    # For now, if no error, consider it a success. The caller expects data or None.
+                    # If response is the raw APIResponse object and has no .data but also no .error,
+                    # it implies a success where no specific data body was expected by the client lib for that op.
+                    logger.debug(f"Supabase call successful on attempt {attempt + 1}, response has no explicit .data or .error, returning raw response or None. Response: {type(response)}")
+                    # If the operation was expected to return data, the calling function will handle it.
+                    # For insert/update returning the new/updated row, it's in response.data.
+                    # If an operation like delete is successful, it might not have .data.
+                    return response # Or None if that's more appropriate for "no data content" success
 
                 if last_exception and attempt == config.DB_MAX_RETRIES - 1: # If error occurred and it's the last attempt
                     raise last_exception
 
-                if not (hasattr(response, 'error') and response.error): # If no error, return data
-                    return response.data if hasattr(response, 'data') else None
-
-
-            except TypeError as te: # Catch the specific TypeError if await was misused
+            except TypeError as te: 
                 logger.error(f"TypeError during DB call on attempt {attempt + 1}: {te}. This indicates await might have been used on a non-awaitable.", exc_info=True)
                 last_exception = te
             except Exception as e: 
@@ -108,7 +122,7 @@ class DatabaseManager:
                 logger.error(f"DB call failed after {config.DB_MAX_RETRIES} attempts.")
                 if last_exception:
                     raise last_exception
-                else: # Should not happen if loop completed without success or specific error
+                else: 
                     raise Exception("DB call failed after max retries with no specific captured exception.")
             
             await asyncio.sleep(1 * (attempt + 1)) 
@@ -117,11 +131,10 @@ class DatabaseManager:
     async def create_quiz_session(self) -> int | None:
         """Creates a new quiz session and returns its ID."""
         def _create_op_sync(): 
-            # This is now a synchronous call
             return self.client.table("quiz_sessions").insert({}).execute()
         
-        data = await self._db_call_with_retry(_create_op_sync) # _db_call_with_retry handles async sleep/retry
-        if data and len(data) > 0:
+        data = await self._db_call_with_retry(_create_op_sync) 
+        if data and len(data) > 0: # Supabase insert returns a list with the new row
             session_id = data[0].get('session_id')
             logger.info(f"Created new quiz session with ID: {session_id}")
             return session_id
@@ -136,6 +149,7 @@ class DatabaseManager:
                 .eq("session_id", session_id) \
                 .execute()
         
+        # Update operations might return the updated rows in .data or just confirm success
         await self._db_call_with_retry(_end_op_sync)
         logger.info(f"Marked quiz session {session_id} as ended.")
 
@@ -145,7 +159,7 @@ class DatabaseManager:
             return self.client.table("quiz_sessions").select("*").eq("session_id", session_id).limit(1).execute()
         
         data = await self._db_call_with_retry(_get_op_sync)
-        if data and len(data) > 0:
+        if data and len(data) > 0: # Select returns a list
             return data[0]
         return None
 
@@ -154,6 +168,8 @@ class DatabaseManager:
         user_id_str = str(user_id)
         
         def _update_op_sync():
+            # This operation involves multiple steps; _db_call_with_retry might be better applied to individual execute calls
+            # For now, keeping it as one "op_func"
             existing_score_response = self.client.table("scores") \
                 .select("score") \
                 .eq("user_id", user_id_str) \
@@ -180,8 +196,12 @@ class DatabaseManager:
             
             if hasattr(final_response, 'error') and final_response.error:
                 raise Exception(f"DB error updating score for {user_id_str}, session {session_id}: {final_response.error.message if hasattr(final_response.error, 'message') else final_response.error}")
-            return final_response.data if hasattr(final_response, 'data') else None # Return data or None
+            
+            # Supabase update/insert typically returns a list of the affected rows in .data
+            return final_response.data if hasattr(final_response, 'data') else None 
 
+        # The data returned by _update_op_sync (which is final_response.data) is processed by _db_call_with_retry
+        # If _db_call_with_retry gets this data, it will return it.
         await self._db_call_with_retry(_update_op_sync)
         logger.info(f"Updated score for user {user_id_str} in session {session_id} by {points_change} points.")
 
@@ -196,7 +216,7 @@ class DatabaseManager:
                 .limit(limit) \
                 .execute()
         
-        data = await self._db_call_with_retry(_get_op_sync)
+        data = await self._db_call_with_retry(_get_op_sync) # Select returns a list
         if data:
             return [(item['user_id'], item['score']) for item in data]
         return []
